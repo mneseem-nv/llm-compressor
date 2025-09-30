@@ -28,8 +28,9 @@ from llmcompressor.pipelines.cache import IntermediatesCache
 from llmcompressor.utils.fsdp.helpers import get_fsdp_parent
 from llmcompressor.utils.helpers import calibration_forward_context
 from llmcompressor.utils.pytorch.module import get_layer_by_name
+from llmcompressor.modifiers.awq.psx_quant_utils import psx_nvfp4, psx_mxfp4
 
-__all__ = ["AWQModifier"]
+__all__ = ["AWQModifier", "AWQModifierNoQuant"]
 
 
 class AWQModifier(Modifier, QuantizationMixin):
@@ -114,6 +115,7 @@ class AWQModifier(Modifier, QuantizationMixin):
         and weights to determine the scaling factor
     """
 
+    quant_format: str = "int4"
     # Allow arbitrary types because AWQMapping has fields of type torch.nn.Module
     model_config: ConfigDict = ConfigDict(arbitrary_types_allowed=True)
 
@@ -181,25 +183,26 @@ class AWQModifier(Modifier, QuantizationMixin):
 
         model._group_size = next(iter(group_size_set))
 
-        in_num_bits_set = set(
-            group.input_activations.num_bits
-            for group in config.config_groups.values()
-            if group.input_activations is not None
-        )
-        assert len(in_num_bits_set) == 0 or in_num_bits_set == {16}, (
-            "AWQ activations must be 16-bit precision, "
-            f"input activations {in_num_bits_set} not allowed"
-        )
+        
+        # in_num_bits_set = set(
+        #     group.input_activations.num_bits
+        #     for group in config.config_groups.values()
+        #     if group.input_activations is not None
+        # )
+        # assert len(in_num_bits_set) == 0 or in_num_bits_set == {16}, (
+        #     "AWQ activations must be 16-bit precision, "
+        #     f"input activations {in_num_bits_set} not allowed"
+        # )
 
-        out_num_bits_set = set(
-            group.output_activations.num_bits
-            for group in config.config_groups.values()
-            if group.output_activations is not None
-        )
-        assert len(out_num_bits_set) == 0 or out_num_bits_set == {16}, (
-            "AWQ activations must be 16-bit precision, "
-            f"output activations {out_num_bits_set} not allowed"
-        )
+        # out_num_bits_set = set(
+        #     group.output_activations.num_bits
+        #     for group in config.config_groups.values()
+        #     if group.output_activations is not None
+        # )
+        # assert len(out_num_bits_set) == 0 or out_num_bits_set == {16}, (
+        #     "AWQ activations must be 16-bit precision, "
+        #     f"output activations {out_num_bits_set} not allowed"
+        # )
 
         return model
 
@@ -537,8 +540,20 @@ class AWQModifier(Modifier, QuantizationMixin):
         self._assert_all_activations_consumed()
 
     def _run_samples(self, module: Module) -> List[torch.Tensor]:
+        collected_samples = self._parent_args_cache[module]
+        quantized_collected_samples = []
+        for sample in collected_samples:
+            if "input" in sample:
+                sample["input"] = _pseudo_quantize_tensor(sample["input"], quant_format=self.quant_format)
+            elif "x" in sample:
+                sample["x"] = _pseudo_quantize_tensor(sample["x"], quant_format=self.quant_format)
+            elif "hidden_states" in sample:
+                sample["hidden_states"] = _pseudo_quantize_tensor(sample["hidden_states"], quant_format=self.quant_format)
+            else:
+                print(f"will SKIP: {sample.keys()} in module {module.__class__.__name__}")
+            quantized_collected_samples.append(sample)
         outputs = [
-            module(**batch_kwargs) for batch_kwargs in self._parent_args_cache[module]
+            module(**batch_kwargs) for batch_kwargs in quantized_collected_samples
         ]
         return [
             # If Tuple, assume that first argument is the input
@@ -608,7 +623,8 @@ class AWQModifier(Modifier, QuantizationMixin):
                         symmetric=self._symmetric,
                         bit_width=self._num_bits,
                         group_size=self._group_size,
-                    )[0]
+                        quant_format=self.quant_format,
+                    )
                     / _scalesview,
                 )
 
@@ -679,47 +695,53 @@ class AWQModifier(Modifier, QuantizationMixin):
 
 
 def _pseudo_quantize_tensor(
-    w: torch.Tensor, symmetric: bool = False, bit_width: int = 8, group_size: int = -1
+    w: torch.Tensor, symmetric: bool = False, bit_width: int = 8, group_size: int = -1, quant_format: str = "int4"
 ):
-    org_w_shape = w.shape
-    if group_size > 0:
-        assert org_w_shape[-1] % group_size == 0, (
-            f"org_w_shape ({org_w_shape[-1]}) must be a multiple "
-            + f"of group_size ({group_size})!"
-        )
-        w = w.reshape(-1, group_size)
-    assert w.dim() == 2
-    assert torch.isnan(w).sum() == 0
+    if quant_format == "nvfp4":
+        return psx_nvfp4(w)
+    elif quant_format == "mxfp4":
+        return psx_mxfp4(w)
+    elif quant_format == "int4":
+        org_w_shape = w.shape
+        if group_size > 0:
+            assert org_w_shape[-1] % group_size == 0, (
+                f"org_w_shape ({org_w_shape[-1]}) must be a multiple "
+                + f"of group_size ({group_size})!"
+            )
+            w = w.reshape(-1, group_size)
+        assert w.dim() == 2
+        assert torch.isnan(w).sum() == 0
 
-    # zero point quantization
-    if not symmetric:
-        max_val = w.amax(dim=1, keepdim=True)
-        min_val = w.amin(dim=1, keepdim=True)
-        max_int = 2**bit_width - 1
-        min_int = 0
-        scales = (max_val - min_val).clamp(min=1e-5) / max_int
-        zeros = (-torch.round(min_val / scales)).clamp_(min_int, max_int)
-        w = (
-            torch.clamp(torch.round(w / scales) + zeros, min_int, max_int) - zeros
-        ) * scales
-        zeros = (zeros - 2 ** (bit_width - 1)).view(org_w_shape[0], -1)
+        # zero point quantization
+        if not symmetric:
+            max_val = w.amax(dim=1, keepdim=True)
+            min_val = w.amin(dim=1, keepdim=True)
+            max_int = 2**bit_width - 1
+            min_int = 0
+            scales = (max_val - min_val).clamp(min=1e-5) / max_int
+            zeros = (-torch.round(min_val / scales)).clamp_(min_int, max_int)
+            w = (
+                torch.clamp(torch.round(w / scales) + zeros, min_int, max_int) - zeros
+            ) * scales
+            zeros = (zeros - 2 ** (bit_width - 1)).view(org_w_shape[0], -1)
+        else:
+            max_val = w.abs().amax(dim=1, keepdim=True)
+            max_val = max_val.clamp(min=1e-5)
+            max_int = 2 ** (bit_width - 1) - 1
+            min_int = -(2 ** (bit_width - 1))
+            scales = max_val / max_int
+            zeros = None
+            w = torch.clamp(torch.round(w / scales), min_int, max_int) * scales
+
+        assert torch.isnan(scales).sum() == 0
+        assert torch.isnan(w).sum() == 0
+
+        scales = scales.view(org_w_shape[0], -1)
+        w = w.reshape(org_w_shape)
+
+        return w, scales, zeros
     else:
-        max_val = w.abs().amax(dim=1, keepdim=True)
-        max_val = max_val.clamp(min=1e-5)
-        max_int = 2 ** (bit_width - 1) - 1
-        min_int = -(2 ** (bit_width - 1))
-        scales = max_val / max_int
-        zeros = None
-        w = torch.clamp(torch.round(w / scales), min_int, max_int) * scales
-
-    assert torch.isnan(scales).sum() == 0
-    assert torch.isnan(w).sum() == 0
-
-    scales = scales.view(org_w_shape[0], -1)
-    w = w.reshape(org_w_shape)
-
-    return w, scales, zeros
-
+        raise ValueError(f"Invalid quant_format: {quant_format}")
 
 def _accumulate_mean(
     inp: torch.Tensor,
@@ -768,3 +790,129 @@ def get_lowest_common_parent(names: List[str], module: Module) -> Tuple[str, Mod
         if not isinstance(parent, torch.nn.ModuleList):
             return parent_name, parent
         parent_name = ".".join(parent_name.split(".")[:-1])
+
+class AWQModifierNoQuant(AWQModifier):
+
+    def on_initialize(self, state: State, **kwargs) -> bool:
+        if self.mappings is None:
+            self.mappings = get_layer_mappings_from_architecture(
+                architecture=state.model.__class__.__name__
+            )
+        self._set_resolved_mappings(state.model)
+        return True
+
+    def on_start(self, state: State, event: Event, **kwargs):
+        self.started_ = True
+        state.model.apply(disable_quantization)   # keep forwards unquantized
+        self._setup_activation_cache_hooks()
+
+    def on_end(self, state: State, event: Event, **kwargs):
+        self._assert_all_activations_consumed()
+        self.ended_ = True
+        self.remove_hooks()
+
+    def _compute_best_scale(
+        self,
+        x_mean: torch.Tensor,
+        w_mean: torch.Tensor,
+        parent_module: torch.nn.Module,
+        linears2scale: List[torch.nn.Linear],
+        fp16_outputs: List[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Compute loss and select best scales
+
+        L(s) = || Q(W * s) (s^-1 * X) - W * X ||
+        Q: weight quantization function | _pseudo_quantize_tensor(W * s)
+        X: inputs from calib dataset    | X
+        W: original weights in FP16     | layer
+        s: per channel scaling factor   | s^-1 * X
+        """
+        n_grid = 5
+        history = []
+        best_ratio = -1
+        best_scales = None
+        best_error = float("inf")
+
+        org_sd = {
+            k: v.cpu()
+            for k, v in parent_module.state_dict().items()
+            if v.device != torch.device("meta")
+        }
+
+        device = get_execution_device(parent_module)
+        x_mean = x_mean.view(-1).to(device)
+        w_mean = w_mean.view(-1).to(device)
+
+        for ratio in range(n_grid):
+            # create new scales
+            ratio = ratio / n_grid
+
+            # NOTE: s^-1 * x is fused here, according to paper
+            if self.duo_scaling:
+                scales = (x_mean.pow(ratio) / (w_mean.pow(1 - ratio) + 1e-4)).clamp(
+                    min=1e-4
+                )
+            else:
+                scales = x_mean.pow(ratio).clamp(min=1e-4).view(-1)
+            scales = scales / (scales.max() * scales.min()).sqrt()
+            _scalesview = scales.view(1, -1).to(device)
+            # avoid scaling values that overflow
+            scales[torch.isinf(scales)] = 1
+            scales[torch.isnan(scales)] = 1
+
+            # Q(W * s)
+            for linear in linears2scale:
+                # print (f"linear.weight.shape: {linear.weight.shape}")
+                # print(f"before scaling linear.weight[0:16]: {linear.weight[0:16]} scale {_scalesview[0,0:2]}")
+                linear.weight.mul_(_scalesview)
+                # print(f"after scaling linear.weight[0:16]: {linear.weight[0:16]}")
+                # # print linear input and output feature shapes
+                # print(f"linear input feature shape: {linear.in_features}")
+                # print(f"linear output feature shape: {linear.out_features}")
+                # # pass a random input of shape linear.in_features, linear.out_features through the linear layer
+                # input = torch.randn(linear.out_features, linear.in_features).to(torch.bfloat16)
+                # output = linear(input)
+                # print(f"output shape: {output.shape}")
+                # print(f"output[0:16]: {output[0:16]}")
+                update_offload_parameter(
+                    linear,
+                    "weight",
+                    _pseudo_quantize_tensor(
+                        w=linear.weight.data,
+                        symmetric=self._symmetric,
+                        bit_width=self._num_bits,
+                        group_size=self._group_size,
+                        quant_format=self.quant_format,
+                    )
+                    / _scalesview,
+                )
+
+            # W * X
+            int_w_outputs = self._run_samples(parent_module)
+
+            # compute mean squared error (L2 norm)
+            loss = self._compute_loss(fp16_outputs, int_w_outputs, device)
+
+            history.append(loss)
+            if loss < best_error:
+                best_error = loss
+                best_ratio = ratio
+                best_scales = scales.clone()
+
+            parent_module.load_state_dict(org_sd, strict=False)
+
+        if best_ratio == -1:
+            logger.debug(history)
+            raise Exception(
+                "No finite loss was found in best scalesgrid search. This typically "
+                "means NaN values are appearing in the forward pass of the parent "
+                "module. If you encounter this error, raise an issue at "
+                "https://github.com/vllm-project/llm-compressor/issues"
+            )
+
+        assert (
+            torch.isnan(best_scales).sum() == 0
+        ), f"Nan found in scales: {best_scales}"
+
+        return best_scales.detach().cpu()
