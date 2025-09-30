@@ -1,4 +1,5 @@
 from psx_formats.utils import _C  # where nvfp4_clippy lives
+import torch
 
 def psx_nvfp4(x):
     amax = torch.max(torch.abs(x.to(torch.float)))
